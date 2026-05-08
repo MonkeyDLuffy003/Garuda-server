@@ -10,6 +10,9 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+with app.app_context():
+    pass  # init_db called below after function is defined
+
 # ─────────────────────────────────────────────
 # CONFIG — set in Render environment variables
 # ─────────────────────────────────────────────
@@ -24,8 +27,8 @@ GROQ_MODEL = "llama-3.1-8b-instant"
 DEV_SECRET  = "GARUDA_TEJATECH_DEV"
 MAX_USERS   = 400
 DAILY_BASE  = 20
-REFERRAL_BONUS_NEW  = 5   # bonus requests on day 1 for new user
-REFERRAL_BONUS_PERM = 2   # permanent extra requests per referral for referrer
+REFERRAL_BONUS_NEW  = 5
+REFERRAL_BONUS_PERM = 2
 DB_PATH     = "garuda_server.db"
 
 # ─────────────────────────────────────────────
@@ -64,6 +67,9 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Initialize DB on startup
+init_db()
+
 def get_user(username):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -95,7 +101,6 @@ def create_user(username, password, referred_by="", is_dev=False):
             VALUES (?, ?, ?, ?, ?, ?)''',
             (username, hash_password(password), ref_code,
              referred_by, datetime.datetime.now().isoformat(), 1 if is_dev else 0))
-        # Give referrer permanent bonus
         if referred_by:
             c.execute("UPDATE users SET referral_count = referral_count + 1 WHERE username = ?",
                       (referred_by,))
@@ -119,7 +124,6 @@ def get_daily_limit(username):
     if is_dev:
         return 9999
     limit = DAILY_BASE + (ref_count * REFERRAL_BONUS_PERM)
-    # First day bonus for referred users
     if referred_by:
         try:
             reg_date = datetime.datetime.fromisoformat(registered_at).date()
@@ -254,17 +258,16 @@ def home():
 
 @app.route("/register", methods=["POST"])
 def register():
-    data        = request.json or {}
-    username    = data.get("username", "").strip()
-    password    = data.get("password", "").strip()
-    referral    = data.get("referral_code", "").strip()
-    dev_code    = data.get("dev_code", "").strip()
+    data     = request.json or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+    referral = data.get("referral_code", "").strip()
+    dev_code = data.get("dev_code", "").strip()
 
     if len(username) < 3:
         return jsonify({"success": False, "message": "Username must be at least 3 characters."})
     if len(password) < 4:
         return jsonify({"success": False, "message": "Password must be at least 4 characters."})
-
     if get_user(username):
         return jsonify({"success": False, "message": "Username taken. Try another."})
 
@@ -304,14 +307,11 @@ def login():
     user = get_user(username)
     if not user:
         return jsonify({"success": False, "message": "User not found. Please register."})
-
     if user[2] != hash_password(password):
         return jsonify({"success": False, "message": "Wrong password."})
-
-    if not user[8]:  # is_active
+    if not user[8]:
         return jsonify({"success": False, "message": "Account disabled."})
 
-    # Dev code upgrade
     if dev_code == DEV_SECRET and not user[7]:
         conn = sqlite3.connect(DB_PATH)
         c    = conn.cursor()
@@ -418,13 +418,13 @@ def status():
     limit = get_daily_limit(username)
     used  = get_today_usage(username)
     return jsonify({
-        "success":       True,
-        "username":      username,
-        "developer":     dev,
-        "used_today":    used,
-        "remaining":     9999 if dev else max(0, limit - used),
-        "limit":         limit,
-        "referral_code": user[3],
+        "success":        True,
+        "username":       username,
+        "developer":      dev,
+        "used_today":     used,
+        "remaining":      9999 if dev else max(0, limit - used),
+        "limit":          limit,
+        "referral_code":  user[3],
         "referral_count": user[5]
     })
 
@@ -452,6 +452,5 @@ def admin_users():
                     "slots_remaining": MAX_USERS - len(users), "users": users})
 
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

@@ -1,14 +1,17 @@
 import os
 import re
+import hashlib
 import sqlite3
 import datetime
+import random
+import string
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────
-# CONFIG — set these in Render environment vars
+# CONFIG — set in Render environment variables
 # ─────────────────────────────────────────────
 GEMINI_CHAT_KEY   = os.environ.get("GEMINI_CHAT_KEY", "")
 GEMINI_SEARCH_KEY = os.environ.get("GEMINI_SEARCH_KEY", "")
@@ -18,10 +21,22 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
-DEVELOPER_EMAIL = "manikantatejaswarooparni@gmail.com"
+DEV_SECRET  = "GARUDA_TEJATECH_DEV"
 MAX_USERS   = 400
-DAILY_LIMIT = 20
+DAILY_BASE  = 20
+REFERRAL_BONUS_NEW  = 5   # bonus requests on day 1 for new user
+REFERRAL_BONUS_PERM = 2   # permanent extra requests per referral for referrer
 DB_PATH     = "garuda_server.db"
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def generate_referral_code(username):
+    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=5))
+    return f"GRD-{username[:4].upper()}-{suffix}"
 
 # ─────────────────────────────────────────────
 # DATABASE
@@ -30,12 +45,15 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        username      TEXT UNIQUE,
-        email         TEXT,
-        registered_at TEXT,
-        is_developer  INTEGER DEFAULT 0,
-        is_active     INTEGER DEFAULT 1
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        username        TEXT UNIQUE,
+        password_hash   TEXT,
+        referral_code   TEXT UNIQUE,
+        referred_by     TEXT,
+        referral_count  INTEGER DEFAULT 0,
+        registered_at   TEXT,
+        is_developer    INTEGER DEFAULT 0,
+        is_active       INTEGER DEFAULT 1
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS usage (
         id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,26 +72,62 @@ def get_user(username):
     conn.close()
     return row
 
-def register_user(username, email=""):
+def get_user_by_referral(code):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE referral_code = ?", (code,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def create_user(username, password, referred_by="", is_dev=False):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM users WHERE is_developer = 0")
     count = c.fetchone()[0]
-    if count >= MAX_USERS:
+    if not is_dev and count >= MAX_USERS:
         conn.close()
         return False, "full"
-    is_dev = 1 if email.strip().lower() == DEVELOPER_EMAIL else 0
+    ref_code = generate_referral_code(username)
     try:
-        c.execute(
-            "INSERT INTO users (username, email, registered_at, is_developer) VALUES (?, ?, ?, ?)",
-            (username, email, datetime.datetime.now().isoformat(), is_dev)
-        )
+        c.execute('''INSERT INTO users
+            (username, password_hash, referral_code, referred_by, registered_at, is_developer)
+            VALUES (?, ?, ?, ?, ?, ?)''',
+            (username, hash_password(password), ref_code,
+             referred_by, datetime.datetime.now().isoformat(), 1 if is_dev else 0))
+        # Give referrer permanent bonus
+        if referred_by:
+            c.execute("UPDATE users SET referral_count = referral_count + 1 WHERE username = ?",
+                      (referred_by,))
         conn.commit()
         conn.close()
-        return True, "ok"
+        return True, ref_code
     except sqlite3.IntegrityError:
         conn.close()
         return False, "taken"
+
+def get_daily_limit(username):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT is_developer, referral_count, referred_by, registered_at FROM users WHERE username = ?",
+              (username,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return DAILY_BASE
+    is_dev, ref_count, referred_by, registered_at = row
+    if is_dev:
+        return 9999
+    limit = DAILY_BASE + (ref_count * REFERRAL_BONUS_PERM)
+    # First day bonus for referred users
+    if referred_by:
+        try:
+            reg_date = datetime.datetime.fromisoformat(registered_at).date()
+            if reg_date == datetime.date.today():
+                limit += REFERRAL_BONUS_NEW
+        except Exception:
+            pass
+    return limit
 
 def get_today_usage(username):
     today = datetime.date.today().isoformat()
@@ -97,6 +151,12 @@ def increment_usage(username):
     conn.commit()
     conn.close()
 
+def check_limit(username):
+    limit     = get_daily_limit(username)
+    used      = get_today_usage(username)
+    remaining = limit - used
+    return (remaining > 0, max(0, remaining), limit)
+
 def is_developer(username):
     conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
@@ -104,13 +164,6 @@ def is_developer(username):
     row = c.fetchone()
     conn.close()
     return bool(row and row[0] == 1)
-
-def check_limit(username):
-    if is_developer(username):
-        return True, 999
-    used      = get_today_usage(username)
-    remaining = DAILY_LIMIT - used
-    return (remaining > 0, max(0, remaining))
 
 # ─────────────────────────────────────────────
 # AI HELPERS
@@ -197,32 +250,86 @@ def fetch_news(category="general"):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "Garuda server running", "version": "1.0"})
+    return jsonify({"status": "Garuda server running", "version": "2.0"})
 
 @app.route("/register", methods=["POST"])
 def register():
-    data     = request.json or {}
-    username = data.get("username", "").strip()
-    email    = data.get("email", "").strip()
+    data        = request.json or {}
+    username    = data.get("username", "").strip()
+    password    = data.get("password", "").strip()
+    referral    = data.get("referral_code", "").strip()
+    dev_code    = data.get("dev_code", "").strip()
 
     if len(username) < 3:
         return jsonify({"success": False, "message": "Username must be at least 3 characters."})
+    if len(password) < 4:
+        return jsonify({"success": False, "message": "Password must be at least 4 characters."})
 
-    user = get_user(username)
-    if user:
-        role = "developer" if user[3] else "user"
-        return jsonify({"success": True, "message": f"Welcome back, {username}!", "role": role})
+    if get_user(username):
+        return jsonify({"success": False, "message": "Username taken. Try another."})
 
-    ok, msg = register_user(username, email)
+    is_dev      = dev_code == DEV_SECRET
+    referred_by = ""
+
+    if referral:
+        ref_user = get_user_by_referral(referral)
+        if ref_user:
+            referred_by = ref_user[1]
+        else:
+            return jsonify({"success": False, "message": "Invalid referral code."})
+
+    ok, result = create_user(username, password, referred_by, is_dev)
     if ok:
-        role = "developer" if email.lower() == DEVELOPER_EMAIL else "user"
-        welcome = "Developer account activated! Unlimited access." if role == "developer" \
-                  else f"Welcome to Garuda, {username}! You have {DAILY_LIMIT} requests/day."
-        return jsonify({"success": True, "message": welcome, "role": role})
-    if msg == "taken":
+        role    = "developer" if is_dev else "user"
+        bonus   = f" +{REFERRAL_BONUS_NEW} bonus requests today!" if referred_by else ""
+        welcome = f"Welcome to Garuda, {username}!{bonus}" if not is_dev else \
+                  "Developer account activated! Unlimited access."
+        return jsonify({"success": True, "message": welcome,
+                        "role": role, "referral_code": result})
+    if result == "taken":
         return jsonify({"success": False, "message": "Username taken. Try another."})
     return jsonify({"success": False,
-                    "message": "Garuda is at full capacity. Stay tuned for the official launch!"})
+                    "message": "Garuda is at full capacity. Stay tuned for official launch!"})
+
+@app.route("/login", methods=["POST"])
+def login():
+    data     = request.json or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+    dev_code = data.get("dev_code", "").strip()
+
+    if not username or not password:
+        return jsonify({"success": False, "message": "Username and password required."})
+
+    user = get_user(username)
+    if not user:
+        return jsonify({"success": False, "message": "User not found. Please register."})
+
+    if user[2] != hash_password(password):
+        return jsonify({"success": False, "message": "Wrong password."})
+
+    if not user[8]:  # is_active
+        return jsonify({"success": False, "message": "Account disabled."})
+
+    # Dev code upgrade
+    if dev_code == DEV_SECRET and not user[7]:
+        conn = sqlite3.connect(DB_PATH)
+        c    = conn.cursor()
+        c.execute("UPDATE users SET is_developer=1 WHERE username=?", (username,))
+        conn.commit()
+        conn.close()
+
+    dev   = is_developer(username)
+    limit = get_daily_limit(username)
+    used  = get_today_usage(username)
+    return jsonify({
+        "success":       True,
+        "message":       f"Welcome back, {username}!",
+        "role":          "developer" if dev else "user",
+        "referral_code": user[3],
+        "remaining":     9999 if dev else max(0, limit - used),
+        "limit":         limit
+    })
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -231,18 +338,17 @@ def chat():
     query    = data.get("query", "")
 
     if not get_user(username):
-        return jsonify({"success": False, "message": "User not found. Please register."})
+        return jsonify({"success": False, "message": "User not found. Please login."})
 
-    allowed, remaining = check_limit(username)
+    allowed, remaining, limit = check_limit(username)
     if not allowed:
         return jsonify({"success": False,
-                        "message": "Daily limit reached (20/20). Resets at midnight!"})
+                        "message": f"Daily limit reached ({limit}/{limit}). Resets at midnight!"})
 
     response = call_gemini(GEMINI_CHAT_KEY, query, system=GARUDA_SYSTEM)
     increment_usage(username)
     return jsonify({"success": True, "response": response,
-                    "remaining": remaining - 1,
-                    "developer": is_developer(username)})
+                    "remaining": remaining - 1, "developer": is_developer(username)})
 
 @app.route("/research", methods=["POST"])
 def research():
@@ -252,26 +358,25 @@ def research():
     category = data.get("category", "")
 
     if not get_user(username):
-        return jsonify({"success": False, "message": "User not found. Please register."})
+        return jsonify({"success": False, "message": "User not found. Please login."})
 
-    allowed, remaining = check_limit(username)
+    allowed, remaining, limit = check_limit(username)
     if not allowed:
         return jsonify({"success": False,
-                        "message": "Daily limit reached (20/20). Resets at midnight!"})
+                        "message": f"Daily limit reached ({limit}/{limit}). Resets at midnight!"})
 
     if category in ["general", "tech", "sports"]:
-        raw    = fetch_news(category)
-        prompt = f"Summarize these news headlines clearly:\n{raw}"
+        raw      = fetch_news(category)
+        prompt   = f"Summarize these news headlines clearly:\n{raw}"
         response = call_gemini(GEMINI_SEARCH_KEY, prompt, system=RESEARCH_SYSTEM)
     else:
-        web    = search_web(query)
-        prompt = f"Web data:\n{web}\n\nQuestion: {query}" if web else query
+        web      = search_web(query)
+        prompt   = f"Web data:\n{web}\n\nQuestion: {query}" if web else query
         response = call_gemini(GEMINI_SEARCH_KEY, prompt, system=RESEARCH_SYSTEM)
 
     increment_usage(username)
     return jsonify({"success": True, "response": response,
-                    "remaining": remaining - 1,
-                    "developer": is_developer(username)})
+                    "remaining": remaining - 1, "developer": is_developer(username)})
 
 @app.route("/translate", methods=["POST"])
 def translate():
@@ -288,13 +393,11 @@ def translate():
         result = call_groq(f"Detect language. Reply ONLY with 2-letter ISO code:\n{text[:200]}",
                            max_tokens=5, temperature=0)
         return jsonify({"success": True, "lang": result.lower()[:5] or "en"})
-
     elif action == "to_english":
         if lang == "en":
             return jsonify({"success": True, "text": text})
         result = call_groq(f"Translate to English. Return ONLY translation:\n{text}", max_tokens=500)
         return jsonify({"success": True, "text": result or text})
-
     elif action == "from_english":
         if lang == "en":
             return jsonify({"success": True, "text": text})
@@ -311,15 +414,18 @@ def status():
     user     = get_user(username)
     if not user:
         return jsonify({"success": False, "message": "Not registered."})
-    used = get_today_usage(username)
-    dev  = is_developer(username)
+    dev   = is_developer(username)
+    limit = get_daily_limit(username)
+    used  = get_today_usage(username)
     return jsonify({
-        "success":    True,
-        "username":   username,
-        "developer":  dev,
-        "used_today": used,
-        "remaining":  999 if dev else max(0, DAILY_LIMIT - used),
-        "limit":      "unlimited" if dev else DAILY_LIMIT
+        "success":       True,
+        "username":      username,
+        "developer":     dev,
+        "used_today":    used,
+        "remaining":     9999 if dev else max(0, limit - used),
+        "limit":         limit,
+        "referral_code": user[3],
+        "referral_count": user[5]
     })
 
 @app.route("/admin/users", methods=["GET"])
@@ -330,7 +436,8 @@ def admin_users():
     conn = sqlite3.connect(DB_PATH)
     c    = conn.cursor()
     c.execute("""
-        SELECT u.username, u.email, u.registered_at, u.is_developer,
+        SELECT u.username, u.referral_code, u.referral_count,
+               u.registered_at, u.is_developer,
                COALESCE(SUM(us.count), 0) as total
         FROM users u
         LEFT JOIN usage us ON u.username = us.username
@@ -338,8 +445,9 @@ def admin_users():
     """)
     rows  = c.fetchall()
     conn.close()
-    users = [{"username": r[0], "email": r[1], "registered": r[2],
-              "developer": bool(r[3]), "total_requests": r[4]} for r in rows]
+    users = [{"username": r[0], "referral_code": r[1], "referrals": r[2],
+              "registered": r[3], "developer": bool(r[4]),
+              "total_requests": r[5]} for r in rows]
     return jsonify({"success": True, "total_users": len(users),
                     "slots_remaining": MAX_USERS - len(users), "users": users})
 
